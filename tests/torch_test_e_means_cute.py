@@ -1584,5 +1584,22 @@ if cuda:
             ).train(x)
 
 
+class TestCuteClosingHandover(unittest.TestCase):
+    @unittest.skipUnless(_ready(), "pinned CuTe stack on SM90 required")
+    def test_revived_centroid_rows_are_searched(self):
+        rs = np.random.RandomState(0)
+        x = ((rs.randn(64, 8) * 4)[rs.randint(0, 64, 20000)] + rs.randn(20000, 8)).astype("float32")
+        init = torch.from_numpy(x[rs.choice(len(x), 64, replace=False)]).cuda()
+        x = torch.from_numpy(x).cuda().bfloat16()
+        km = Emeans(8, 64, nepochs=1, batch_size=500, assignment_backend="cute")
+        _, labels = km.train(x, init)
+        # CuTe returns second distances without their indices: no row takes a
+        # second, every row held by a revived centroid is searched instead.
+        self.assertEqual(km.recipe["closing_handover"], "search")
+        self.assertEqual(km.closing_handover_stats["second"], 0)
+        self.assertGreater(km.closing_handover_stats["searched"], 0)
+        self.assertGreaterEqual(int(labels.min()), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

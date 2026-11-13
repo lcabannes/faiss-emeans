@@ -7,6 +7,7 @@
 
 import time
 
+import numpy as np
 import torch
 
 from .torch_backend import (
@@ -27,11 +28,16 @@ from .base import (
     _epoch_seed,
     _resolve_recipe,
     _resolve_unused_threshold,
+    _compact_label_dtype,
     _round_power_of_two as _round_power_of_two,
     _scheduled_alpha,
     _same_operation,
 )
 
+
+# Rows per step of the closing-pass relabelling, bounding its temporaries.
+_HANDOVER_CHUNK = 1 << 22
+_TORCH_LABEL_DTYPES = {np.int8: torch.int8, np.int16: torch.int16, np.int32: torch.int32}
 
 __all__ = [
     "Emeans",
@@ -87,7 +93,13 @@ class Emeans(_EmeansBase):
     data follows or within the first pass: one rule at every budget and
     dimension. Both centroids of a split made during the last pass keep their
     running (EMA) positions: their uniform last-pass averages would mix in rows
-    from before the split. A value revives clusters below that
+    from before the split. With ``closing_handover`` (default) and captured
+    assignments, ``train`` hands the last-pass rows such a revived centroid held
+    before moving to their second-nearest centroid from the same assignment,
+    unless it moved after them too: those rows are assigned again like a
+    training batch, at their share of one epoch's cost; the caller-driven
+    ``begin``/``accumulate``/``update`` loop leaves labels to the caller. A
+    value revives clusters below that
     fraction of the mean mass instead, splitting mass-sampled donors (line 9,
     Appendix J); 0 disables revival.
 
@@ -134,10 +146,12 @@ class Emeans(_EmeansBase):
         spherical=False,
         unused_threshold=None,
         max_points_per_centroid=None,
+        closing_handover=True,
     ):
         self.d = int(d)
         self.k = int(k)
         self._set_max_points_per_centroid(max_points_per_centroid)
+        self.closing_handover = bool(closing_handover)
         nepochs = float(nepochs)
         self.nepochs = int(nepochs) if nepochs.is_integer() else nepochs
         self.batch_size = batch_size
@@ -168,6 +182,10 @@ class Emeans(_EmeansBase):
         self._usage = None
         self._centroids = None
         self._removal_stats = self._axes = self._moved = None
+        # Closing-pass relabelling of rows held by revived centroids (train() only).
+        self._handover = None
+        self._handover_planned = False
+        self.closing_handover_stats = None
         self._check_graph = self._check_pool = self._check_async = self._check_splits = None
         self._pending_stats = None
         self._removal_folded = False
@@ -419,6 +437,13 @@ class Emeans(_EmeansBase):
         _write_float_splits(self._centroids, self._usage, chosen, victims, self._input_dtype, _SPLIT_EPSILON,
                             count=moves)
         removal_split(stats, self._axes, chosen, victims, count=moves, moved=self._moved)
+        if self._handover is not None:
+            # O(k): when each revived centroid moved. Entries of victims past
+            # the pair count are not written, so they are masked out.
+            h = self._handover
+            valid = torch.arange(len(victims), device=victims.device) < moves
+            h["moved_at"].scatter_reduce_(0, torch.where(valid, victims, 0),
+                                          torch.where(valid, h["done"], -1), "amax")
 
     def _removal_candidates_device(self, removal):
         median = (removal[(self.k - 1) // 2] + removal[self.k // 2]) / 2
@@ -481,9 +506,76 @@ class Emeans(_EmeansBase):
             self._removal_stats[target] = self._removal_stats[source]
             self._axes[target] = self._axes[source]
             self._moved[source] = self._moved[target] = True
+        if self._handover is not None:
+            h = self._handover
+            h["moved_at"][torch.as_tensor(target, device=h["done"].device)] = h["done"]
         self._n_splits += len(source)
         self._invalidate_readout()
         return len(source)
+
+    def _handover_start(self, labels, second, x):
+        """Begin the closing pass's handover. ``labels`` (n,) holds the
+        captured assignments and ``second`` (n,) each row's second-nearest index
+        from the same assignment (-1 if unknown). A revival only records, per
+        revived centroid, how many closing-pass rows were assigned when it
+        moved (``moved_at``, O(k)); the rows are sorted out once, at the end."""
+        if self._check_graph:
+            # The captured device check predates the handover: fold its split
+            # count and capture it again with the recording.
+            self._n_splits = self.n_splits
+            self._check_graph = self._check_pool = self._check_splits = None
+        device = labels.device
+        self._handover = dict(
+            labels=labels, second=second, x=x,
+            moved_at=torch.full((self.k,), -1, dtype=torch.int64, device=device),
+            done=torch.zeros((), dtype=torch.int64, device=device))
+
+    def _handover_finish(self, order, rows):
+        """One pass over the ``rows`` closing-pass rows in visiting ``order``: a
+        row assigned before its centroid moved takes its second-nearest unless
+        that centroid moved after the row's assignment too; those rows are
+        assigned again like a training batch (same backend and chunks, against
+        the current centroids), so this costs their share of one epoch. Moved
+        rows join their new centroid's closing sums; the centroids they left
+        moved, keep their EMA positions, and their sums are not used."""
+        h, self._handover = self._handover, None
+        labels, second, x, moved_at = h["labels"], h["second"], h["x"], h["moved_at"]
+        handed, search = [], []
+        if not bool((moved_at >= 0).any()):  # O(k): nothing moved in this pass.
+            rows = 0
+        for begin in range(0, rows, _HANDOVER_CHUNK):
+            index = order[begin:min(begin + _HANDOVER_CHUNK, rows)]
+            rank = torch.arange(begin, begin + len(index), device=index.device)
+            stale = rank < moved_at[labels[index]]
+            if not bool(stale.any()):
+                continue
+            nearest2 = second[index].long()
+            usable = stale & (nearest2 >= 0) & (moved_at[nearest2.clamp_min(0)] <= rank)
+            labels[index[usable]] = nearest2[usable]
+            handed.append(index[usable])
+            search.append(index[stale & ~usable])
+        handed = torch.cat(handed) if handed else order[:0]
+        search = torch.cat(search) if search else order[:0]
+        if len(search):
+            # Assign as a closing-pass training chunk does: same backend, row
+            # count and outputs, so no kernel or workspace is built for it and
+            # the cost is these rows' share of an epoch, in whole chunks.
+            centroids, centroid_norm = self._prepare_torch_assignment(self._centroids)
+            rows_per_chunk = min(self.recipe["assignment_chunk_size"], self.recipe["batch_size"])
+            second_out = x.new_empty(rows_per_chunk, dtype=torch.float32)
+            second_labels_out = (x.new_empty(rows_per_chunk, dtype=torch.int64)
+                                 if getattr(self._execution_backend, "second_labels", False) else None)
+            for begin in range(0, len(search), rows_per_chunk):
+                chunk = search[begin:begin + rows_per_chunk]
+                padded = torch.cat((chunk, chunk[-1:].expand(rows_per_chunk - len(chunk))))
+                _, nearest = self._assign_rows(self._prepare_rows(x[padded]), centroids, centroid_norm,
+                                               None, None, second_out, second_labels_out)
+                labels[chunk] = nearest[:len(chunk)]
+        for chunk in torch.cat((handed, search)).split(_HANDOVER_CHUNK):
+            rows_x = self._prepare_rows(x[chunk])
+            self._pass_sums.index_add_(0, labels[chunk], rows_x.to(self._pass_sums.dtype))
+            self._pass_counts.index_add_(0, labels[chunk], self._pass_counts.new_ones(len(chunk)))
+        self.closing_handover_stats = dict(second=len(handed), searched=len(search))
 
     def _assign_rows(
         self,
@@ -493,6 +585,7 @@ class Emeans(_EmeansBase):
         distance_out=None,
         labels_out=None,
         second_out=None,
+        second_labels_out=None,
     ):
         """Assign floating rows against represented centroids."""
         return self._execution_backend.assign(
@@ -503,6 +596,7 @@ class Emeans(_EmeansBase):
             distance_out,
             labels_out,
             second_out,
+            **({"second_labels_out": second_labels_out} if second_labels_out is not None else {}),
         )
 
     def begin(self, global_n, init_centroids):
@@ -596,7 +690,7 @@ class Emeans(_EmeansBase):
         x = self._prepare_input(x)
         return self._accumulate(x.detach())
 
-    def _accumulate(self, x, index=None, labels_out=None):
+    def _accumulate(self, x, index=None, labels_out=None, second_labels_out=None):
         # Indexed matrix training gathers only assignment chunks, never B*d.
         n = len(x) if index is None else len(index)
         if n == 0 and self._pending_stats is not None:
@@ -608,7 +702,10 @@ class Emeans(_EmeansBase):
                 stats["labels"] = x.new_empty(0, dtype=torch.int64)
             return stats
         try:
-            stats = self._accumulate_core(x, index, labels_out=labels_out)
+            # Only plain models hand rows over; subclasses keep their signature.
+            stats = self._accumulate_core(
+                x, index, labels_out=labels_out,
+                **({} if second_labels_out is None else {"second_labels_out": second_labels_out}))
         except BaseException:
             self._failed = True
             self.assignments = None
@@ -616,7 +713,8 @@ class Emeans(_EmeansBase):
         self._pending_stats = stats
         return stats
 
-    def _accumulate_core(self, x, index=None, raw=False, labels_out=None, ema=None):
+    def _accumulate_core(self, x, index=None, raw=False, labels_out=None, ema=None,
+                         second_labels_out=None):
         n = len(x) if index is None else len(index)
         pending_n = (
             0 if self._pending_stats is None else self._pending_stats["n"]
@@ -663,9 +761,18 @@ class Emeans(_EmeansBase):
             # Nothing moves once frozen: no removal statistics.
             second = (None if self._removal_stats is None or self._frozen()
                       else rows.new_empty(len(rows), dtype=torch.float32))
+            # Second-nearest labels for the closing-pass handover: -1 where the backend has none.
+            second_labels = None
+            if second_labels_out is not None:
+                if second is None or not getattr(self._execution_backend, "second_labels", False):
+                    second_labels_out[begin:end].fill_(-1)
+                else:
+                    second_labels = rows.new_empty(len(rows), dtype=torch.int64)
             distance, labels = self._assign_rows(
-                rows, centroids, centroid_norm, None, None, second
+                rows, centroids, centroid_norm, None, None, second, second_labels
             )
+            if second_labels is not None:
+                second_labels_out[begin:end].copy_(second_labels)
             # A training step whose batch is one chunk may apply the removal EMA here.
             fold = ema is not None and pending_n == 0 and n == target <= chunk_size
             fused = second is not None and isinstance(self._execution_backend, TritonBackend) and (
@@ -812,9 +919,12 @@ class Emeans(_EmeansBase):
     def finalize(self):
         """Set and return FP32 closing means from the final pass's assignments.
 
-        Never-assigned centroids retain their current positions. No new search
-        is performed. All epochs must be complete; repeated finalization returns
-        the same result.
+        Never-assigned centroids retain their current positions, and so do
+        centroids moved during that pass. With ``capture_assignments``,
+        ``train`` first hands rows held by a centroid revived during that pass
+        to their second-nearest centroid, assigning again only rows whose second
+        moved after them too. All epochs must be complete; repeated finalization
+        returns the same result.
         """
         if self._failed:
             raise RuntimeError("create a new object after execution failure")
@@ -917,7 +1027,8 @@ class Emeans(_EmeansBase):
         return x.is_contiguous()
 
     def _capture_step(
-        self, x, index, rate, batches, epoch_rates, position, labels_out=None
+        self, x, index, rate, batches, epoch_rates, position, labels_out=None,
+        second_labels_out=None
     ):
         current = torch.cuda.current_stream(x.device)
         stream = torch.cuda.Stream(device=x.device)
@@ -932,6 +1043,11 @@ class Emeans(_EmeansBase):
             with torch.cuda.stream(stream):
                 self._execution_backend.initialize_capture()
                 # The context manager empties process caches; use primitives.
+                # A re-capture follows eager work whose small device-to-host
+                # copies leave pinned host blocks in use; capture_begin then
+                # trips PyTorch's CachingHostAllocator assert unless they drain.
+                torch.cuda.synchronize(x.device)
+                torch._C._host_emptyCache()
                 graph.capture_begin(
                     pool=pool.id, capture_error_mode="thread_local"
                 )
@@ -945,6 +1061,7 @@ class Emeans(_EmeansBase):
                     # Explicit staging is recorded even before the final epoch.
                     stats = self._accumulate_core(
                         x, index, raw=True, labels_out=labels_out,
+                        **({} if second_labels_out is None else {"second_labels_out": second_labels_out}),
                         **({} if self._removal_stats is None else {"ema": (self._removal_stats, rate[0], rate[1])}),
                     )
                     self._apply_statistics(
@@ -1024,6 +1141,17 @@ class Emeans(_EmeansBase):
             init_centroids = self._initial_centroid_values(init_centroids)
         self.begin(n, init_centroids)
         x = self._prepare_input(x)
+        # Cost-based revival can move a centroid during the closing pass;
+        # captured rows it held then take their second-nearest centroid.
+        self._handover_planned = bool(
+            self.closing_handover and self.capture_assignments and self._removal_stats is not None
+            and (self._input_dtype is None or self._input_dtype.is_floating_point)
+            # Subclasses with their own accumulation do not record second labels.
+            and type(self)._accumulate_core is Emeans._accumulate_core)
+        self.recipe["closing_handover"] = (
+            ("second_nearest" if getattr(self._execution_backend, "second_labels", False)
+             else "search")
+            if self._handover_planned else None)
         self._report_header_once()
         if self._reports():
             self._report_preprocessing(start, given_init, n)
@@ -1032,7 +1160,7 @@ class Emeans(_EmeansBase):
         graph_has_sums = False
         graph = cached = _pool = closing = None
         captured_bindings = ()
-        assignments = batch_labels = None
+        assignments = batch_labels = second_labels = batch_second = None
         try:
             if self._replay_eligible(x):
                 alphas = [
@@ -1057,11 +1185,20 @@ class Emeans(_EmeansBase):
                 position = torch.zeros(1, dtype=torch.int64, device=device)
             if self.capture_assignments:
                 assignments = torch.empty(n, dtype=torch.int64, device=device)
-                if self.recipe["epoch_rows"][-1] < n:
+                if self.recipe["epoch_rows"][-1] < n or self._handover_planned:
                     assignments.fill_(-1)
                 if rates is not None:
                     batch_labels = torch.empty_like(index)
+                if self._handover_planned:
+                    label_dtype = _TORCH_LABEL_DTYPES[_compact_label_dtype(self.k)]
+                    second_labels = torch.full((n,), -1, dtype=label_dtype, device=device)
+                    if rates is not None:
+                        batch_second = torch.empty(len(index), dtype=label_dtype, device=device)
             for epoch, rows in enumerate(self.recipe["epoch_rows"]):
+                closing_pass = epoch == len(self.recipe["epoch_rows"]) - 1
+                handover = closing_pass and self._handover_planned
+                if handover:
+                    self._handover_start(assignments, second_labels, x)
                 shuffled = torch.randperm(
                     n,
                     generator=_torch_generator(
@@ -1117,6 +1254,7 @@ class Emeans(_EmeansBase):
                                 epoch_rates,
                                 position,
                                 batch_labels,
+                                batch_second,
                             )
                             captured_bindings = (
                                 self._execution_backend.capture_bindings(
@@ -1131,6 +1269,9 @@ class Emeans(_EmeansBase):
                         ):
                             # Consume captured row IDs before the next replay.
                             assignments[index] = batch_labels
+                            if handover:
+                                second_labels[index] = batch_second
+                                self._handover["done"] += len(batch)
                         if self._pass_sums is not None and not graph_has_sums:
                             # Same dense ATen closing add, before revival/next
                             # stats zero.
@@ -1156,30 +1297,43 @@ class Emeans(_EmeansBase):
                         chunk_size = self.recipe["assignment_chunk_size"]
                         for offset in range(0, len(batch), chunk_size):
                             chunk = batch[offset : offset + chunk_size]
-                            stats = self._accumulate(x, chunk)
+                            second = (torch.empty(len(chunk), dtype=second_labels.dtype,
+                                                  device=device) if handover else None)
+                            stats = self._accumulate(x, chunk, None, second)
                             # Move this chunk's labels from pending statistics
                             # to the public result.
                             labels = stats.pop("labels")
                             assignments[chunk] = labels
-                            labels = None
+                            if handover:
+                                second_labels[chunk] = second
+                            labels = second = None
+                        if handover:
+                            self._handover["done"] += len(batch)
                         self.update(stats)
                     else:
-                        stats = self._accumulate(x, batch, batch_labels)
+                        second = (torch.empty(len(batch), dtype=second_labels.dtype, device=device)
+                                  if handover else None)
+                        stats = self._accumulate(x, batch, batch_labels, second)
+                        if assignments is not None and closing_pass:
+                            # Before update(): a revival there relabels them.
+                            assignments[batch] = stats["labels"]
+                            if handover:
+                                second_labels[batch] = second
+                                self._handover["done"] += len(batch)
+                        second = None
                         self.update(stats)
                         if rates is not None:
                             position.add_(1)
                         primed = primed or replay
-                        if (
-                            assignments is not None
-                            and epoch == len(self.recipe["epoch_rows"]) - 1
-                        ):
-                            assignments[batch] = stats["labels"]
                 self.end_epoch()
                 # Reporting drains work; retain the owned graph/pool for the
                 # next epoch.
+            if self._handover is not None:
+                self._handover_finish(order, self.recipe["epoch_rows"][-1])
         except BaseException:
             self._failed = True
             self.assignments = None
+            self._handover = None
             if rates is not None:
                 torch.cuda.current_stream(device).synchronize()
             raise
@@ -1195,7 +1349,7 @@ class Emeans(_EmeansBase):
                 graph = cached = closing = None
                 order = shuffled = batches = None
                 index = rate = epoch_rates = position = None
-                batch_labels = None
+                batch_labels = batch_second = second_labels = None
         self.finalize()
         self.assignments = assignments
         return self.centroids, self.assignments

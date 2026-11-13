@@ -130,6 +130,9 @@ class TorchBackend:
         )
         return represented, norm
 
+    # Whether assign() can also return each row's second-nearest index.
+    second_labels = True
+
     def assign(
         self,
         x,
@@ -139,6 +142,7 @@ class TorchBackend:
         distance_out=None,
         labels_out=None,
         second_out=None,
+        second_labels_out=None,
     ):
         x_norm = None if spherical else x.float().square().sum(dim=1)
         best_score = torch.full(
@@ -147,6 +151,8 @@ class TorchBackend:
         labels = torch.zeros(len(x), dtype=torch.int64, device=x.device)
         if second_out is not None:
             second_out.fill_(float("inf"))
+        if second_labels_out is not None:
+            second_labels_out.fill_(-1)
 
         for begin in range(0, len(centroids), self.centroid_chunk_size):
             end = min(begin + self.centroid_chunk_size, len(centroids))
@@ -170,7 +176,15 @@ class TorchBackend:
             block_score, block_label = score.min(dim=1)
             better = block_score < best_score
             if second_out is not None:
-                block_second = score.scatter_(1, block_label[:, None], float("inf")).amin(dim=1)
+                block_second, block_second_label = score.scatter_(
+                    1, block_label[:, None], float("inf")).min(dim=1)
+                if second_labels_out is not None:
+                    # Before the scores move: the demoted best, or this block's runner-up.
+                    torch.where(
+                        better,
+                        torch.where(best_score <= block_second, labels, block_second_label + begin),
+                        torch.where(block_score < second_out, block_label + begin, second_labels_out),
+                        out=second_labels_out)
                 torch.where(better, best_score.minimum(block_second),
                             second_out.minimum(block_score), out=second_out)
             torch.where(better, block_score, best_score, out=best_score)
@@ -338,6 +352,7 @@ class TritonBackend(TorchBackend):
         distance_out=None,
         labels_out=None,
         second_out=None,
+        second_labels_out=None,
     ):
         if x.shape[1] != centroids.shape[1]:
             from .triton_assignment import _pad_columns
@@ -349,6 +364,7 @@ class TritonBackend(TorchBackend):
             centroid_norm,
             **({"spherical": True} if spherical else {}),
             **({"second_out": second_out} if second_out is not None else {}),
+            **({"second_labels_out": second_labels_out} if second_labels_out is not None else {}),
         )
 
     def accumulate(
@@ -455,6 +471,8 @@ class CuteBackend(TritonBackend):
 
     writes_outputs = True
     name = "cute"
+    # The CuTe kernels return second distances but not their indices.
+    second_labels = False
 
     def require_assignment(self, device):
         _get_cute_functions()[2](device)
@@ -497,7 +515,10 @@ class CuteBackend(TritonBackend):
         distance_out=None,
         labels_out=None,
         second_out=None,
+        second_labels_out=None,
     ):
+        if second_labels_out is not None:
+            raise ValueError("the CuTe backend does not return second-nearest labels")
         assign, _, _ = _get_cute_functions()
         return assign(x, centroids, distance_out, labels_out,
                       **({"second_out": second_out} if second_out is not None else {}))
