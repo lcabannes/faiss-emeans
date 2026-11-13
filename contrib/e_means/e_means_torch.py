@@ -932,6 +932,11 @@ class Emeans(_EmeansBase):
             with torch.cuda.stream(stream):
                 self._execution_backend.initialize_capture()
                 # The context manager empties process caches; use primitives.
+                # A re-capture follows eager work whose small device-to-host
+                # copies leave pinned host blocks in use; capture_begin then
+                # trips PyTorch's CachingHostAllocator assert unless they drain.
+                torch.cuda.synchronize(x.device)
+                torch._C._host_emptyCache()
                 graph.capture_begin(
                     pool=pool.id, capture_error_mode="thread_local"
                 )
