@@ -4168,5 +4168,186 @@ assert model.centroids.item() == 1
         torch.testing.assert_close(model.obj, control.obj, rtol=0, atol=0)
 
 
+def _check_closing_handover(case, x, init, backends, spherical=False, nepochs=1):
+    """One run per backend: rows held by a centroid revived while closing take
+    their second-nearest from the same assignment unless it moved after them
+    too, and are otherwise assigned again; closing means match the returned
+    labels, and the training error is lower than with the labels before."""
+    for backend in backends:
+        km = Emeans(x.shape[1], len(init), nepochs=nepochs, batch_size=500, assignment_backend=backend,
+                    spherical=spherical)
+        state = {}
+
+        def handover_finish(order, rows, km=km, state=state, finish=km._handover_finish):
+            h = km._handover
+            state.update(before=h["labels"].clone(), second=h["second"].clone(),
+                         moved_at=h["moved_at"].clone(), order=order[:rows].clone())
+            return finish(order, rows)
+
+        def finalize(km=km, state=state, finalize=km.finalize):
+            state["moved"] = km._moved.clone()
+            state["ema"] = km._centroids.clone()
+            return finalize()
+
+        km._handover_finish, km.finalize = handover_finish, finalize
+        centroids, labels = km.train(x, init)
+        moved, before = state["moved"], state["before"]
+        case.assertEqual(km.recipe["closing_handover"], "second_nearest")
+        case.assertGreater(km.closing_handover_stats["second"], 0)
+        rows = x.float()
+        # The rule, row by row, in visiting order.
+        order, second, moved_at = state["order"], state["second"].long(), state["moved_at"]
+        rank = torch.empty_like(order)
+        rank[order] = torch.arange(len(order), device=order.device)
+        visited = torch.zeros(len(x), dtype=torch.bool, device=order.device)
+        visited[order] = True
+        stale = visited & (rank < moved_at[before.clamp_min(0)])
+        case.assertTrue(bool((second[stale] >= 0).all()), backend)  # Every stale row has one.
+        handed = stale & (moved_at[second.clamp_min(0)] <= rank)
+        searched = stale & ~handed
+        case.assertEqual(int(handed.sum()), km.closing_handover_stats["second"], backend)
+        case.assertEqual(int(searched.sum()), km.closing_handover_stats["searched"], backend)
+        case.assertTrue(bool((labels[~stale] == before[~stale]).all()), backend)
+        case.assertTrue(bool((labels[handed] == second[handed]).all()), backend)
+        case.assertTrue(bool((second[visited] != before[visited]).all()), backend)
+        if searched.any():
+            # Searched rows: nearest to the EMA positions training ended on
+            # (up to the backend's assignment rounding).
+            ema = state["ema"].double()
+            if spherical:
+                ema = torch.nn.functional.normalize(ema, dim=1)
+            distance = torch.cdist(rows[searched].double(), ema).square()
+            chosen = distance.gather(1, labels[searched][:, None])[:, 0]
+            case.assertTrue(bool((chosen <= distance.min(1).values * (1 + 1e-2) + 1e-3).all()), backend)
+
+        def closing(lab):
+            sums = torch.zeros_like(centroids, dtype=torch.float64).index_add_(0, lab, rows.double())
+            counts = torch.bincount(lab, minlength=len(centroids))
+            closed = ~moved & (counts > 0)
+            mean = sums[closed] / counts[closed, None]
+            if spherical:
+                mean = torch.nn.functional.normalize(mean, dim=1)
+            out = centroids.clone()  # Moved centroids keep their EMA position either way.
+            out[closed] = mean.float()
+            return out
+
+        torch.testing.assert_close(centroids, closing(labels), rtol=1e-5, atol=1e-5)
+        error = float((rows - centroids[labels]).square().sum(1).mean())
+        without = float((rows - closing(before)[before]).square().sum(1).mean())
+        case.assertLess(error, without, backend)
+
+
+def _handover_mixture():
+    rs = np.random.RandomState(0)
+    x = ((rs.randn(64, 8) * 4)[rs.randint(0, 64, 20000)] + rs.randn(20000, 8)).astype("float32")
+    return torch.from_numpy(x), torch.from_numpy(x[rs.choice(len(x), 64, replace=False)])
+
+
+def _check_handover_parity(case, device):
+    """The NumPy class and the tensor class apply the rule identically: the same
+    closing-pass state (captured labels, second labels, when each centroid was
+    revived, visiting order) gives the same labels, counts and closing sums."""
+    rs = np.random.RandomState(0)
+    k, d, n = 64, 8, 6000
+    centroids = (rs.randn(k, d) * 10).astype("float32")
+    owner = rs.randint(0, k, n)
+    x = (centroids[owner] + 0.05 * rs.randn(n, d)).astype("float32")
+    second = (owner + 1 + rs.randint(0, k - 1, n)) % k
+    order = rs.permutation(n)
+    moved_at = np.full(k, -1, dtype="int64")
+    revived = rs.choice(k, 20, replace=False)
+    moved_at[revived] = rs.randint(0, n, len(revived))  # Each revived at a random point of the pass.
+    results = []
+    for numpy_class in (True, False):
+        if numpy_class:
+            km = NumpyEmeans(d, k, nepochs=1, batch_size=500)
+            km.begin(n, centroids)
+            labels_np = owner.copy()  # Rewritten in place by the handover.
+            km._handover_start(labels_np, second.astype("int16"), x)
+            km._handover["moved_at"] = moved_at.copy()
+            km._handover_finish(order, n)
+            results.append((km.closing_handover_stats, km._pass_sums.astype("float64"),
+                            np.asarray(km._pass_counts, dtype="float64"), labels_np))
+        else:
+            km = Emeans(d, k, nepochs=1, batch_size=500, assignment_backend="native")
+            tx = torch.from_numpy(x).to(device)
+            km.begin(n, torch.from_numpy(centroids).to(device))
+            km._prepare_input(tx)
+            labels_t = torch.from_numpy(owner.copy()).to(device)  # Rewritten in place too.
+            km._handover_start(labels_t, tx, second=True)
+            km._handover["second"].copy_(torch.from_numpy(second).to(device))
+            km._handover["moved_at"].copy_(torch.from_numpy(moved_at).to(device))
+            km._handover_finish(torch.from_numpy(order).to(device), n)
+            results.append((km.closing_handover_stats, km._pass_sums.double().cpu().numpy(),
+                            km._pass_counts.double().cpu().numpy(), labels_t.cpu().numpy()))
+    (stats_np, sums_np, counts_np, labels_np), (stats_t, sums_t, counts_t, labels_t) = results
+    np.testing.assert_array_equal(labels_np, labels_t)
+    case.assertGreater(int((labels_np != owner).sum()), 0)
+    case.assertEqual(stats_np, stats_t)
+    case.assertGreater(stats_np["second"], 0)
+    case.assertGreater(stats_np["searched"], 0)
+    np.testing.assert_array_equal(counts_np, counts_t)
+    np.testing.assert_allclose(sums_np, sums_t, rtol=1e-5, atol=1e-3)
+
+
+class TestHandoverParity(unittest.TestCase):
+    @unittest.skipUnless(hasattr(__import__("faiss"), "accumulate_cluster_sums"),
+                         "faiss built with #5915's C++ helpers required")
+    def test_numpy_and_tensor_classes_agree_on_cpu(self):
+        _check_handover_parity(self, "cpu")
+
+    @unittest.skipUnless(torch.cuda.is_available() and hasattr(__import__("faiss"), "accumulate_cluster_sums"),
+                         "CUDA and faiss built with #5915's C++ helpers required")
+    def test_numpy_and_tensor_classes_agree_on_cuda(self):
+        _check_handover_parity(self, "cuda")
+
+
+class TestClosingHandoverCpu(unittest.TestCase):
+    def test_rows_of_centroid_revived_while_closing_are_assigned_again(self):
+        x, init = _handover_mixture()
+        _check_closing_handover(self, x, init, ("auto",))
+
+
+@unittest.skipUnless(TRITON_CUDA, "CUDA with Triton required")
+class TestClosingHandover(unittest.TestCase):
+    def test_triton_second_labels_match_reference(self):
+        from faiss.contrib.e_means.triton_assignment import _use_split_k, assign_rows
+        torch.manual_seed(0)
+        # Second labels resolved after the scan (d <= 128) and searched in it (d > 128), on
+        # both kernels: direct (the paper's 32768-row batches) and split-K, padded included.
+        for b, k, d, split in ((32768, 4096, 96, False), (32768, 4096, 128, False),
+                               (32768, 4096, 256, False), (4096, 2048, 96, True),
+                               (128, 8192, 128, True), (300, 5000, 100, True),
+                               (128, 8192, 256, True), (2048, 8192, 1024, True)):
+            self.assertEqual(_use_split_k(b, k, d, True), split, (b, k, d))
+            x = torch.randn(b, d, device="cuda").bfloat16()
+            c = torch.randn(k, d, device="cuda").bfloat16()
+            norm = c.float().square().sum(1)
+            second = torch.empty(b, device="cuda")
+            second_labels = torch.empty(b, dtype=torch.int32, device="cuda")
+            _, labels = assign_rows(x, c, norm, second_out=second, second_labels_out=second_labels)
+            score = norm.double()[None] - 2 * x.double() @ c.double().t()
+            want = score.topk(2, dim=1, largest=False).values[:, 1]
+            got = score.gather(1, second_labels.long()[:, None])[:, 0]
+            scale = want.abs() + x.double().square().sum(1)
+            self.assertTrue(bool(((got - want).abs() <= 2e-3 * scale).all()), (b, k, d))
+            self.assertTrue(bool((second_labels.long() != labels).all()), (b, k, d))
+            # The label's distance is the reported second distance.
+            torch.testing.assert_close(
+                (score.gather(1, second_labels.long()[:, None])[:, 0] + x.double().square().sum(1)).float(),
+                second, rtol=2e-3, atol=2e-3)
+
+    def test_rows_of_centroid_revived_while_closing_are_assigned_again(self):
+        x, init = _handover_mixture()
+        for nepochs in (1, 1.2, 1.6):
+            _check_closing_handover(self, x.cuda().bfloat16(), init.cuda(), ("triton", "native"),
+                                    nepochs=nepochs)
+
+    def test_spherical(self):
+        x, init = _handover_mixture()
+        x, init = (torch.nn.functional.normalize(t, dim=1) for t in (x, init))
+        _check_closing_handover(self, x.cuda().bfloat16(), init.cuda(), ("triton", "native"), spherical=True)
+
+
 if __name__ == "__main__":
     unittest.main()
