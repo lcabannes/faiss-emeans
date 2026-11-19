@@ -14,12 +14,33 @@ a sequential no-search pass using the final training epoch's saved labels.
 Assignment uses IVF by default; --exact searches all centroid shards instead.
 --kmeans freezes centroids for each epoch and takes their means afterward.
 It requires --batch-size and skips saved-assignment closing.
+--ssd-stage-dir copies the rows each node reads once to a node-local disk,
+verifies them, reads from there and deletes them at exit; it falls back to
+the original files when space is short or a copy fails. It pays off when the
+local disk is faster than the source and the run makes enough passes to
+repay one copy; it needs permission to copy the data locally. On shared
+nodes, set --ssd-stage-max-gib to your share of the local disk: the
+scheduler may not reserve it. Each pass shifts the scan-chunk grid at random
+(--no-ssd-grid-offset keeps it fixed), so the rows that share a scan chunk
+change from pass to pass; such rows share a batch more often than random
+rows (1B, 4 groups, 64 MiB: 0.63% per pass with the offset, 0.83% without,
+0.21% for random pairs). --ssd-chunk-mib 1 brings this to the random rate,
+but the fill thread's per-chunk Python work then competes with training for
+the GIL and adds stall (see the PR body).
+--ssd-read-threads defaults to 16 / --ssd-chunk-mib, at least 1.
+--ssd-prefetch-chunk-groups 0 gives each prefetch window its own scan
+chunks: about 1x reads per pass instead of 2x, but rows of one scan chunk
+always share a window (1B, 64 MiB with the offset: 0.77% of chunk-mate
+pairs share a batch per pass).
 """
 
 from contextlib import closing as _closing
 from datetime import timedelta
 import json
 import os
+import shutil
+import signal
+import socket
 import time
 
 import numpy as np
@@ -31,14 +52,14 @@ if __package__:
     from .dino_data import (
         DinoBvecs, DinoQueries, DinoTrainset, compute_mse_per_batches,
     )
-    from .ssd_streaming import SSDPrefetch, SSDRowSource
+    from .ssd_streaming import SSDPrefetch, SSDRowSource, stage_files
     from .lloyd import LloydShardedCentroids, LloydShardedCentroidsIVF
 else:
     from demo_sharded_centroids import launch, parser as resident_parser
     from dino_data import (
         DinoBvecs, DinoQueries, DinoTrainset, compute_mse_per_batches,
     )
-    from ssd_streaming import SSDPrefetch, SSDRowSource
+    from ssd_streaming import SSDPrefetch, SSDRowSource, stage_files
     from lloyd import LloydShardedCentroids, LloydShardedCentroidsIVF
 
 from faiss.contrib.e_means import EmeansShardedCentroids, EmeansShardedCentroidsIVF
@@ -72,7 +93,7 @@ def run(args):
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl", timeout=timedelta(minutes=60))
-    source = None
+    source = staged = None
     try:
         rank, ranks = dist.get_rank(), dist.get_world_size()
         final_closing_mean = args.final_closing_mean and not args.kmeans
@@ -86,6 +107,30 @@ def run(args):
             raise ValueError("verbose interval must be positive")
         batch, alpha = training_recipe(args, ranks)
         dataset = DinoBvecs(args.data, args.n)
+        if args.ssd_stage_dir:
+            # The lowest rank on each host copies its host's rows; all ranks
+            # use its result (None: read the originals).
+            hosts, copies = [None] * ranks, [None] * ranks
+            dist.all_gather_object(hosts, socket.gethostname())
+            node = [r for r in range(ranks) if hosts[r] == hosts[rank]]
+            if rank == node[0]:
+                copies[rank] = stage_files(
+                    dataset.paths, dataset.row_bytes,
+                    [(args.n * r // ranks, args.n * (r + 1) // ranks) for r in node],
+                    args.ssd_stage_dir, sums=os.path.join(args.data, "SHA256SUMS"),
+                    max_bytes=args.ssd_stage_max_gib and int(args.ssd_stage_max_gib * (1 << 30)),
+                )
+                if copies[rank]:
+                    staged = os.path.dirname(copies[rank][0])
+
+                    def remove_and_exit(signum, frame):
+                        shutil.rmtree(staged, ignore_errors=True)
+                        signal.signal(signum, signal.SIG_DFL)
+                        os.kill(os.getpid(), signum)
+
+                    signal.signal(signal.SIGTERM, remove_and_exit)
+            dist.all_gather_object(copies, copies[rank])
+            dataset.paths = copies[node[0]] or dataset.paths
         test_vectors = (
             None
             if args.initialization_only
@@ -127,8 +172,9 @@ def run(args):
             chunk_groups=args.ssd_prefetch_chunk_groups,
             chunk_bytes=args.ssd_chunk_mib << 20,
             ram_budget_bytes=int(args.ssd_ram_gib * (1 << 30)),
-            read_threads=args.ssd_read_threads,
+            read_threads=args.ssd_read_threads or max(1, 16 // args.ssd_chunk_mib),
             extract_threads=args.ssd_extract_threads,
+            grid_offset=args.ssd_grid_offset,
         )
         if rank == 0:
             host_bytes = 2 * loader.window_rows * dataset.d
@@ -394,6 +440,8 @@ def run(args):
     finally:
         if source is not None:
             source.close()
+        if staged:
+            shutil.rmtree(staged, ignore_errors=True)
         dist.destroy_process_group()
 
 
@@ -414,7 +462,11 @@ def parser():
         type=int,
         help="global processing batch size; refits the EMA step for e-means",
     )
-    result.add_argument("--ssd-prefetch-chunk-groups", type=int, default=4)
+    result.add_argument(
+        "--ssd-prefetch-chunk-groups", type=int, default=4,
+        help="random chunk groups per pass; 0 = window-aligned: about 1x reads, "
+        "but rows of one scan chunk always share a window",
+    )
     result.add_argument("--ssd-chunk-mib", type=int, default=64)
     result.add_argument("--ssd-ram-gib", type=float, default=16)
     result.add_argument("--ssd-io-depth", type=int, default=256)
@@ -423,7 +475,19 @@ def parser():
         action="store_true",
         help="verify sampled rows, report queued initialization I/O and exit",
     )
-    result.add_argument("--ssd-read-threads", type=int, default=1)
+    result.add_argument("--ssd-read-threads", type=int)
+    result.add_argument(
+        "--ssd-stage-dir",
+        help="copy the rows each node reads here once, verify, read, delete at exit",
+    )
+    result.add_argument(
+        "--ssd-stage-max-gib", type=float,
+        help="read the originals if this node's copy would exceed this size",
+    )
+    result.add_argument(
+        "--no-ssd-grid-offset", dest="ssd_grid_offset", action="store_false",
+        help="keep the scan-chunk grid fixed across passes",
+    )
     result.add_argument("--ssd-extract-threads", type=int, default=4)
     result.add_argument("--verbose-every", type=int, default=10)
     result.add_argument(

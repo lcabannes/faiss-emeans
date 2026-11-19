@@ -10,6 +10,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -30,6 +31,33 @@ def load(name):
 DinoBvecs = load("dino_data").DinoBvecs
 _ssd = load("ssd_streaming")
 SSDRowSource, SSDPrefetch = _ssd.SSDRowSource, _ssd.SSDPrefetch
+
+
+class TestStaging(unittest.TestCase):
+    def test_stage_files_copies_node_rows_and_falls_back(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        blobs = [np.random.RandomState(i).bytes(4 << 20) for i in range(2)]
+        paths = [root / ("%d.bin" % i) for i in range(2)]  # 1,024 rows of 4,096 B each
+        for path, blob in zip(paths, blobs):
+            path.write_bytes(blob)
+        copies = _ssd.stage_files(paths, 4096, [(1500, 1600), (1600, 1700)], str(root / "stage"))
+        self.assertEqual([Path(c).stat().st_size for c in copies], [4 << 20] * 2)
+        rows = slice(1 << 20, 3 << 20)  # second file's rows 476-676, widened to whole MiB
+        self.assertEqual(Path(copies[1]).read_bytes()[rows], blobs[1][rows])
+        self.assertEqual(Path(copies[0]).read_bytes(), bytes(4 << 20))
+        sums = root / "SHA256SUMS"
+        sums.write_text("%s  0.bin\n" % ("0" * 64))
+        with self.assertWarns(UserWarning):
+            self.assertIsNone(_ssd.stage_files(paths, 4096, [(0, 2048)], str(root / "bad"), sums=sums))
+        self.assertEqual(list((root / "bad").iterdir()), [])
+        with mock.patch.object(_ssd.shutil, "disk_usage", return_value=mock.Mock(free=0)):
+            with self.assertWarns(UserWarning):
+                self.assertIsNone(_ssd.stage_files(paths, 4096, [(0, 10)], str(root / "full")))
+        with self.assertWarns(UserWarning):
+            self.assertIsNone(_ssd.stage_files(paths, 4096, [(0, 10)], str(root / "cap"), max_bytes=1))
+        self.assertEqual(list((root / "cap").iterdir()), [])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -84,6 +112,23 @@ class TestDinoStreaming(unittest.TestCase):
             if sequential:
                 expected = (expected - mean.cpu()) / 2.0
             torch.testing.assert_close(torch.cat(outputs).cpu(), expected, rtol=0, atol=0)
+
+    def test_shifted_grid_permutes_and_fills_requested_rows(self):
+        data = np.random.RandomState(3).randint(0, 256, (37, 8), dtype=np.uint8)
+        source = self.source(data)
+        loader = self.loader(source, 10)
+        loader.shift = 7  # grid offset 3 rows
+        for groups in (4, 0):
+            order = _ssd.chunk_grouped_order(
+                source.n, loader.rows_per_chunk, groups, loader.window_rows, 9, 3,
+            )
+            np.testing.assert_array_equal(np.sort(order), np.arange(source.n))
+            with closing(loader.batches(order)) as iterator:
+                outputs = [rows.clone() for rows in iterator]
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                torch.cat(outputs).cpu(), torch.from_numpy(data[order]).float(), rtol=0, atol=0,
+            )
 
     def test_early_close_preserves_owned_output(self):
         data = np.arange(37 * 8, dtype=np.uint16).astype(np.uint8).reshape(37, 8)

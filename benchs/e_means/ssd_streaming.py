@@ -7,15 +7,23 @@
 
 Adapts the window scans and chunk-group permutation from the reference
 ssd_prefetch.py and data.py. Each rank reads its own contiguous row shard.
+stage_files() copies the rows a node reads once to a node-local directory
+and verifies them; each pass can shift the scan-chunk grid.
 """
 
 from concurrent.futures import ThreadPoolExecutor
 import errno
+import glob
+import hashlib
 import math
 import mmap
 import os
 import queue
+import shutil
+import socket
+import tempfile
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -227,27 +235,140 @@ class SSDRowSource:
         return stats
 
 
-def chunk_grouped_order(n, rows_per_chunk, groups, window_rows, seed):
+def stage_files(paths, row_bytes, row_ranges, directory, sums=None, max_bytes=None, threads=16, piece=1 << 30):
+    """Copy the rows a node reads to a local directory; return the copies or None.
+
+    ``row_ranges`` are [begin, end) rows of the concatenated files. Copies
+    keep each file's size (parts not read stay sparse), so offsets do not
+    change. A copy is checked against ``sums`` (SHA256SUMS lines) when a
+    whole listed file is staged, else by its first, middle and last 16 MiB
+    per range; failed ranges are copied once more. If the copy needs more
+    than ``max_bytes`` or the free space, or an I/O error occurs, or a copy
+    stays wrong, this warns, leaves nothing behind and returns None: read
+    the originals. Copies left on this host by exited
+    processes are removed first; the caller removes the returned directory.
+    """
+    merged = []
+    for lo, hi in sorted(row_ranges):
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    spans, first = [], 0
+    for path in paths:
+        size = os.path.getsize(path)
+        last = first + size // row_bytes
+        for lo, hi in merged:  # whole MiB around the rows, for aligned reads at the edges
+            if max(lo, first) < min(hi, last):
+                begin = (max(lo, first) - first) * row_bytes >> 20 << 20
+                spans.append((path, begin, min(size, -(-(min(hi, last) - first) * row_bytes >> 20) << 20)))
+        first = last
+    expected = {}
+    if sums is not None and os.path.exists(sums):
+        with open(sums) as f:
+            expected = {os.path.basename(n): h for h, n in (line.split() for line in f if line.strip())}
+
+    def copy(path, begin, end):
+        with open(path, "rb", buffering=0) as fin, open(staged[path], "r+b") as fout:
+            fin.seek(begin)
+            fout.seek(begin)
+            while begin < end:
+                block = fin.read(min(end - begin, 16 << 20))
+                if not block:
+                    raise OSError(errno.EIO, "short read while staging", path)
+                fout.write(block)
+                begin += len(block)
+
+    def verify(path, begin, end):
+        name = os.path.basename(path)
+        if name in expected and (begin, end) == (0, os.path.getsize(path)):
+            digest = hashlib.sha256()
+            with open(staged[path], "rb") as f:
+                for block in iter(lambda: f.read(16 << 20), b""):
+                    digest.update(block)
+            return digest.hexdigest() == expected[name]
+        with open(path, "rb") as a, open(staged[path], "rb") as b:
+            for at in (begin, (begin + end) // 2, max(begin, end - (16 << 20))):
+                a.seek(at)
+                b.seek(at)
+                if a.read(min(16 << 20, end - at)) != b.read(min(16 << 20, end - at)):
+                    return False
+        return True
+
+    prefix, own = "ssd_stage.%s." % socket.gethostname(), None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        for old in glob.glob(os.path.join(glob.escape(directory), glob.escape(prefix) + "*")):
+            try:  # remove copies whose process has exited
+                os.kill(int(os.path.basename(old)[len(prefix):].split(".")[0]), 0)
+            except ProcessLookupError:
+                shutil.rmtree(old, ignore_errors=True)
+            except (ValueError, PermissionError):
+                pass
+        need = sum(end - begin for _, begin, end in spans)
+        if need + (1 << 30) > shutil.disk_usage(directory).free or need > (max_bytes or need):
+            raise OSError(errno.ENOSPC, "%.1f GB needed" % (need / 1e9), directory)
+        own = tempfile.mkdtemp(prefix=prefix + "%d." % os.getpid(), dir=directory)
+        staged = {p: os.path.join(own, os.path.basename(p)) for p in paths}
+        for path in paths:
+            with open(staged[path], "wb") as f:
+                f.truncate(os.path.getsize(path))
+        with ThreadPoolExecutor(threads) as pool:
+            todo = spans
+            for _ in range(2):
+                pieces = [(p, at, min(end, at + piece)) for p, begin, end in todo for at in range(begin, end, piece)]
+                list(pool.map(lambda job: copy(*job), pieces))
+                todo = [span for span, ok in zip(todo, pool.map(lambda span: verify(*span), todo)) if not ok]
+                if not todo:
+                    return [staged[p] for p in paths]
+        warnings.warn("staged copies in %s stayed wrong: reading the original files" % own)
+    except (OSError, MemoryError) as error:
+        warnings.warn("staging in %s failed (%s): reading the original files" % (directory, error))
+    if own:
+        shutil.rmtree(own, ignore_errors=True)
+    return None
+
+
+def chunk_grouped_order(n, rows_per_chunk, groups, window_rows, seed, offset=0):
     """Permute all rows once, grouping full windows by random scan chunks.
 
     Each full window draws from one of ``groups`` random subsets of scan
     chunks. Full windows are shuffled across groups; short group tails are
-    placed last. Groups=1 gives a uniform row permutation.
+    placed last. Groups=1 gives a uniform row permutation. Groups=0 cuts the
+    randomly ordered chunks into consecutive windows instead (window-aligned):
+    each window reads its own chunks plus at most two shared with its
+    neighbours, so a pass reads about 1x its rows instead of 2x, but rows of
+    one scan chunk always share a window. ``offset`` shifts the scan-chunk
+    grid: chunk c holds rows [c * C - s, (c + 1) * C - s) with
+    s = (C - offset) % C, clipped to [0, n); offset 0 keeps the plain grid.
     """
-    if min(n, rows_per_chunk, groups, window_rows) < 1:
+    if min(n, rows_per_chunk, window_rows) < 1 or groups < 0:
         raise ValueError("permutation dimensions must be positive")
+    if not 0 <= offset < rows_per_chunk:
+        raise ValueError("grid offset must lie in [0, rows_per_chunk)")
     rng = np.random.RandomState(seed)
     if groups == 1:
         return rng.permutation(n)
-    count = math.ceil(n / rows_per_chunk)
+    shift = (rows_per_chunk - offset) % rows_per_chunk
+    count = math.ceil((n + shift) / rows_per_chunk)
+    begin = np.maximum(0, np.arange(count) * rows_per_chunk - shift)
+    end = np.minimum(n, np.arange(1, count + 1) * rows_per_chunk - shift)
+    if groups == 0:
+        chunks = rng.permutation(count)
+        lengths = end[chunks] - begin[chunks]
+        ends = np.cumsum(lengths)
+        starts = begin[chunks] - ends + lengths  # row = q + starts[q's chunk]
+        output = np.empty(n, dtype=np.int64)
+        for at in range(0, n, window_rows):
+            q = at + rng.permutation(min(window_rows, n - at))
+            output[at:at + len(q)] = q + starts[np.searchsorted(ends, q, side="right")]
+        return output
     pieces = np.array_split(rng.permutation(count), min(groups, count))
     layout, full, partial = [], [], []
     for j, chunks in enumerate(pieces):
         last = chunks == count - 1
         chunks = np.r_[chunks[~last], chunks[last]]
-        size = len(chunks) * rows_per_chunk - (
-            count * rows_per_chunk - n if last.any() else 0
-        )
+        size = int((end[chunks] - begin[chunks]).sum())
         layout.append((chunks, size))
         full.extend((j, k) for k in range(size // window_rows))
         if size % window_rows:
@@ -262,6 +383,9 @@ def chunk_grouped_order(n, rows_per_chunk, groups, window_rows, seed):
     output = np.empty(n, dtype=np.int64)
     for j, (chunks, size) in enumerate(layout):
         perm = rng.permutation(size)
+        lengths = end[chunks] - begin[chunks]
+        ends = np.cumsum(lengths)
+        starts = begin[chunks] - ends + lengths  # row = q + starts[q's chunk]
         for k in range(math.ceil(size / window_rows)):
             dest, length = positions[j, k]
             for start in range(0, length, 1 << 20):
@@ -271,13 +395,12 @@ def chunk_grouped_order(n, rows_per_chunk, groups, window_rows, seed):
                     + min(length, start + (1 << 20))
                 ]
                 output[dest + start : dest + start + len(q)] = (
-                    chunks[q // rows_per_chunk] * rows_per_chunk
-                    + q % rows_per_chunk
+                    q + starts[np.searchsorted(ends, q, side="right")]
                 )
     return output
 
 
-def _plan_window(request, n_rows, rows_per_chunk):
+def _plan_window(request, n_rows, rows_per_chunk, shift=0):
     """Group requested rows by chunk, retaining their output destinations.
 
     Adapted from the reference ssd_prefetch._plan_file. Permutation windows
@@ -308,7 +431,7 @@ def _plan_window(request, n_rows, rows_per_chunk):
     if rows is None:
         order = np.argsort(request, kind="stable")
         rows = request[order]
-    chunk_ids = rows // rows_per_chunk
+    chunk_ids = (rows + shift) // rows_per_chunk
     first = (
         np.r_[0, np.flatnonzero(np.diff(chunk_ids)) + 1]
         if count else np.empty(0, dtype=np.int64)
@@ -339,17 +462,18 @@ class SSDPrefetch:
         ram_budget_bytes=16 << 30,
         read_threads=1,
         extract_threads=4,
+        grid_offset=False,
     ):
         if (
             min(
                 batch_size,
-                chunk_groups,
                 chunk_bytes,
                 ram_budget_bytes,
                 read_threads,
                 extract_threads,
             )
             < 1
+            or chunk_groups < 0
         ):
             raise ValueError(
                 "SSD prefetch sizes and thread counts must be positive"
@@ -358,6 +482,7 @@ class SSDPrefetch:
         if self.device.type != "cuda":
             raise ValueError("SSD prefetch requires CUDA")
         self.batch_size, self.chunk_groups = batch_size, chunk_groups
+        self.grid_offset, self.shift = grid_offset, 0
         self.rows_per_chunk = max(1, chunk_bytes // source.row_bytes)
         steps = math.ceil(source.n / batch_size)
         capacity = ram_budget_bytes // (2 * batch_size * source.d)
@@ -374,18 +499,28 @@ class SSDPrefetch:
         self.stats = {"bytes_read": 0, "wait_s": 0.0, "windows": 0}
 
     def order(self, seed):
+        """Permutation for one pass; with grid_offset, the scan-chunk grid
+        moves by a random number of rows drawn from its own stream, so rows
+        that shared a scan chunk in one pass rarely share one in the next."""
+        offset = 0
+        if self.grid_offset:
+            offset = int(np.random.RandomState(
+                (int(seed) * 2654435761 + 0x5EED) % 2**32).randint(self.rows_per_chunk))
+        self.shift = (self.rows_per_chunk - offset) % self.rows_per_chunk
         return chunk_grouped_order(
             self.source.n,
             self.rows_per_chunk,
             self.chunk_groups,
             self.window_rows,
             seed,
+            offset,
         )
 
     def fill_window(self, request, out):
         planned = time.perf_counter()
+        shift = self.shift
         rows, order, chunks, bounds = _plan_window(
-            request, self.source.n, self.rows_per_chunk
+            request, self.source.n, self.rows_per_chunk, shift
         )
         self.stats["plan_s"] = (
             self.stats.get("plan_s", 0.0) + time.perf_counter() - planned
@@ -396,8 +531,8 @@ class SSDPrefetch:
 
         def tasks():
             for chunk, lo, hi in zip(chunks, bounds[:-1], bounds[1:]):
-                begin = int(chunk) * self.rows_per_chunk
-                end = min(self.source.n, begin + self.rows_per_chunk)
+                begin = max(0, int(chunk) * self.rows_per_chunk - shift)
+                end = min(self.source.n, (int(chunk) + 1) * self.rows_per_chunk - shift)
                 yield begin, end, int(lo), int(hi)
 
         def extract(task, views):
