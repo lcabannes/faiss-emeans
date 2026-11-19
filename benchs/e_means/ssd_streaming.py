@@ -11,7 +11,7 @@ stage_files() copies the rows a node reads once to a node-local directory
 and verifies them; each pass can shift the scan-chunk grid.
 """
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 import errno
 import glob
 import hashlib
@@ -441,6 +441,15 @@ def _plan_window(request, n_rows, rows_per_chunk, shift=0):
     return rows, order, chunks, bounds
 
 
+class PassOrder(np.ndarray):
+    """One pass's row order; slices keep the pass's scan-chunk grid shift."""
+
+    shift = 0
+
+    def __array_finalize__(self, obj):
+        self.shift = getattr(obj, "shift", 0)
+
+
 class SSDPrefetch:
     """Two host windows, chunk scans, and one CUDA batch copied ahead.
 
@@ -482,7 +491,8 @@ class SSDPrefetch:
         if self.device.type != "cuda":
             raise ValueError("SSD prefetch requires CUDA")
         self.batch_size, self.chunk_groups = batch_size, chunk_groups
-        self.grid_offset, self.shift = grid_offset, 0
+        self.grid_offset = grid_offset
+        self._slots = self._ahead = None
         self.rows_per_chunk = max(1, chunk_bytes // source.row_bytes)
         steps = math.ceil(source.n / batch_size)
         capacity = ram_budget_bytes // (2 * batch_size * source.d)
@@ -506,19 +516,20 @@ class SSDPrefetch:
         if self.grid_offset:
             offset = int(np.random.RandomState(
                 (int(seed) * 2654435761 + 0x5EED) % 2**32).randint(self.rows_per_chunk))
-        self.shift = (self.rows_per_chunk - offset) % self.rows_per_chunk
-        return chunk_grouped_order(
+        result = chunk_grouped_order(
             self.source.n,
             self.rows_per_chunk,
             self.chunk_groups,
             self.window_rows,
             seed,
             offset,
-        )
+        ).view(PassOrder)
+        result.shift = (self.rows_per_chunk - offset) % self.rows_per_chunk
+        return result
 
     def fill_window(self, request, out):
         planned = time.perf_counter()
-        shift = self.shift
+        shift = getattr(request, "shift", 0)
         rows, order, chunks, bounds = _plan_window(
             request, self.source.n, self.rows_per_chunk, shift
         )
@@ -626,13 +637,16 @@ class SSDPrefetch:
         self._scan_chunks(tasks(), extract)
         self.stats["windows"] += 1
 
-    def batches(self, order=None, *, sequential=False, mean=None, scale=None):
+    def batches(self, order=None, *, sequential=False, mean=None, scale=None, next_order=None):
         """Yield rank-local FP32 CUDA batches, optionally centered.
 
         Sequential mode performs one corpus scan without permutation or
         repeated sparse window scans, for centering and frozen closing means.
         One batch per host window keeps sequential reads from delaying compute.
-        Random mode accepts a permutation prefix for a fractional pass.
+        Random mode accepts a permutation prefix for a fractional pass. With
+        ``next_order`` (an order or a future of one), the last window's turn
+        also fills the next pass's first window into the free buffer; the
+        next call with that same order object starts without waiting.
         """
         self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
         if not sequential and (order is None or len(order) > self.source.n):
@@ -642,42 +656,57 @@ class SSDPrefetch:
         n_rows = self.source.n if sequential else len(order)
         if n_rows == 0:
             return
-        window_rows = self.batch_size if sequential else self.window_rows
-        window_rows = min(window_rows, n_rows)
-        slots = [
-            torch.empty(
-                (window_rows, self.source.d),
-                dtype=torch.uint8,
-                pin_memory=True,
-            )
-            for _ in range(2)
-        ]
-        events = [None, None]
-        pool = ThreadPoolExecutor(1)
+        if sequential:
+            window_rows = min(self.batch_size, n_rows)
+            slots = [
+                torch.empty((window_rows, self.source.d), dtype=torch.uint8, pin_memory=True)
+                for _ in range(2)
+            ]
+            events, pool, ahead = [None, None], ThreadPoolExecutor(1), None
+        else:  # random mode keeps its two windows and fill thread across passes
+            window_rows = self.window_rows
+            if self._slots is None:
+                self._slots = [
+                    torch.empty((window_rows, self.source.d), dtype=torch.uint8, pin_memory=True)
+                    for _ in range(2)
+                ]
+                self._events, self._pool = [None, None], ThreadPoolExecutor(1)
+            slots, events, pool = self._slots, self._events, self._pool
+            ahead, self._ahead = self._ahead, None
+            if ahead is not None and ahead[0] is not order:
+                wait([ahead[2]])
+                ahead = None
+        base = 0 if ahead is None else ahead[1]
+        state = {"future": None}
 
-        def fill(start, slot):
+        def fill(rows_order, start, slot):
             if events[slot] is not None:
                 events[slot].synchronize()
-            end = min(n_rows, start + window_rows)
+            end = min(n_rows if sequential else len(rows_order), start + window_rows)
             if sequential:
                 self.fill_sequential(start, end, slots[slot][: end - start])
             else:
-                self.fill_window(order[start:end], slots[slot][: end - start])
+                self.fill_window(rows_order[start:end], slots[slot][: end - start])
             return end - start
 
         def copies():
-            future = pool.submit(fill, 0, 0)
+            future = ahead[2] if ahead is not None else pool.submit(fill, order, 0, base)
             for window, start in enumerate(
                 range(0, n_rows, window_rows)
             ):
-                slot = window % 2
+                slot = (base + window) % 2
+                state["future"] = future
                 waited = time.perf_counter()
                 length = future.result()
                 self.stats["wait_s"] += time.perf_counter() - waited
+                future = None
                 if start + window_rows < n_rows:
-                    future = pool.submit(
-                        fill, start + window_rows, 1 - slot
-                    )
+                    future = pool.submit(fill, order, start + window_rows, 1 - slot)
+                elif next_order is not None:
+                    following = getattr(next_order, "result", lambda: next_order)()
+                    future = pool.submit(fill, following, 0, 1 - slot)
+                    self._ahead = (following, 1 - slot, future)
+                state["future"] = future
                 for a in range(0, length, self.batch_size):
                     with torch.cuda.stream(self.copy_stream):
                         batch = (
@@ -713,5 +742,10 @@ class SSDPrefetch:
                 yield batch
         finally:
             iterator.close()
-            pool.shutdown(wait=True, cancel_futures=True)
+            if sequential:
+                pool.shutdown(wait=True, cancel_futures=True)
+            elif state["future"] is not None and (
+                self._ahead is None or state["future"] is not self._ahead[2]
+            ):
+                wait([state["future"]])  # a pass closed early: settle its fill
             self.copy_stream.synchronize()

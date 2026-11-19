@@ -28,12 +28,15 @@ rows (1B, 4 groups, 64 MiB: 0.63% per pass with the offset, 0.83% without,
 but the fill thread's per-chunk Python work then competes with training for
 the GIL and adds stall (see the PR body).
 --ssd-read-threads defaults to 16 / --ssd-chunk-mib, at least 1.
+The next pass's order is computed, and its first window filled, during the
+last window of each pass (--no-ssd-prefetch-next-pass turns this off).
 --ssd-prefetch-chunk-groups 0 gives each prefetch window its own scan
 chunks: about 1x reads per pass instead of 2x, but rows of one scan chunk
 always share a window (1B, 64 MiB with the offset: 0.77% of chunk-mate
 pairs share a batch per pass).
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing as _closing
 from datetime import timedelta
 import json
@@ -287,12 +290,24 @@ def run(args):
         if rank == 0:
             print(f"SSD center_scale={scale:.6g}", flush=True)
         closing_codes = None
+        # Each pass's order is computed one pass ahead in a thread, so the
+        # loader can fill the next pass's first window during the last window.
+        order_pool, orders = ThreadPoolExecutor(1), {}
+
+        def pass_order(e):
+            if e not in orders and e < len(model.recipe["epoch_rows"]):
+                rows = model.recipe["epoch_rows"][e] // ranks
+                orders[e] = order_pool.submit(
+                    lambda: loader.order(_epoch_seed(args.seed + rank, e))[:rows]
+                )
+            return orders.get(e)
+
         for epoch, global_rows in enumerate(model.recipe["epoch_rows"]):
             passes = sum(model.recipe["epoch_rows"][:epoch + 1]) / args.n
             epoch_steps = model.recipe["epoch_steps"][epoch]
             batch_objectives, batch_rows = [], []
-            order = loader.order(_epoch_seed(args.seed + rank, epoch))
-            order = order[:global_rows // ranks]
+            order = pass_order(epoch).result()
+            following = pass_order(epoch + 1) if args.ssd_prefetch_next_pass else None
             capture = (
                 final_closing_mean
                 and epoch == len(model.recipe["epoch_rows"]) - 1
@@ -303,7 +318,7 @@ def run(args):
                     closing_codes.fill_(-1)
             at = 0
             with _closing(
-                loader.batches(order, mean=mean, scale=scale)
+                loader.batches(order, mean=mean, scale=scale, next_order=following)
             ) as batches:
                 for step, rows in enumerate(batches, start=1):
                     stats = model.accumulate(rows)
@@ -363,7 +378,7 @@ def run(args):
                     f"revivals_total={model.n_splits}",
                     flush=True,
                 )
-            del order
+            del order, orders[epoch]
         if final_closing_mean:
             if rank == 0:
                 host_bytes = 2 * loader.batch_size * dataset.d
@@ -483,6 +498,10 @@ def parser():
     result.add_argument(
         "--ssd-stage-max-gib", type=float,
         help="read the originals if this node's copy would exceed this size",
+    )
+    result.add_argument(
+        "--no-ssd-prefetch-next-pass", dest="ssd_prefetch_next_pass", action="store_false",
+        help="do not fill the next pass's first window during the last window",
     )
     result.add_argument(
         "--no-ssd-grid-offset", dest="ssd_grid_offset", action="store_false",

@@ -117,11 +117,11 @@ class TestDinoStreaming(unittest.TestCase):
         data = np.random.RandomState(3).randint(0, 256, (37, 8), dtype=np.uint8)
         source = self.source(data)
         loader = self.loader(source, 10)
-        loader.shift = 7  # grid offset 3 rows
         for groups in (4, 0):
             order = _ssd.chunk_grouped_order(
                 source.n, loader.rows_per_chunk, groups, loader.window_rows, 9, 3,
-            )
+            ).view(_ssd.PassOrder)
+            order.shift = 7  # grid offset 3 rows
             np.testing.assert_array_equal(np.sort(order), np.arange(source.n))
             with closing(loader.batches(order)) as iterator:
                 outputs = [rows.clone() for rows in iterator]
@@ -129,6 +129,20 @@ class TestDinoStreaming(unittest.TestCase):
             torch.testing.assert_close(
                 torch.cat(outputs).cpu(), torch.from_numpy(data[order]).float(), rtol=0, atol=0,
             )
+
+    def test_next_pass_prefetch_keeps_rows(self):
+        data = np.random.RandomState(5).randint(0, 256, (37, 8), dtype=np.uint8)
+        source = self.source(data)
+        loader = self.loader(source, 10)
+        orders = [loader.order(seed) for seed in (1, 2, 3)]
+        outputs = []
+        for p, order in enumerate(orders):
+            following = orders[p + 1] if p + 1 < len(orders) else None
+            with closing(loader.batches(order, next_order=following)) as iterator:
+                outputs.append(torch.cat([rows.clone() for rows in iterator]))
+        torch.cuda.synchronize()
+        for order, rows in zip(orders, outputs):
+            torch.testing.assert_close(rows.cpu(), torch.from_numpy(data[order]).float(), rtol=0, atol=0)
 
     def test_early_close_preserves_owned_output(self):
         data = np.arange(37 * 8, dtype=np.uint16).astype(np.uint8).reshape(37, 8)
