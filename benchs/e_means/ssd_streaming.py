@@ -295,7 +295,10 @@ def stage_files(paths, row_bytes, row_ranges, directory, sums=None, max_bytes=No
                     return False
         return True
 
-    prefix, own = "ssd_stage.%s." % socket.gethostname(), None
+    # Copies are named by a short hash of the host name, so the sweep can tell
+    # this host's copies apart without writing the host name to disk.
+    host = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
+    prefix, own = "ssd_stage.%s." % host, None
     try:
         os.makedirs(directory, exist_ok=True)
         for old in glob.glob(os.path.join(glob.escape(directory), glob.escape(prefix) + "*")):
