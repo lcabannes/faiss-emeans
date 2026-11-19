@@ -5,6 +5,7 @@
 
 """CUDA ownership and read-ahead checks for the faithful SSD prefetcher."""
 
+import contextlib
 from contextlib import closing
 import importlib.util
 from pathlib import Path
@@ -143,6 +144,42 @@ class TestDinoStreaming(unittest.TestCase):
         torch.cuda.synchronize()
         for order, rows in zip(orders, outputs):
             torch.testing.assert_close(rows.cpu(), torch.from_numpy(data[order]).float(), rtol=0, atol=0)
+
+    def test_pipelined_stage_keeps_rows_and_falls_back(self):
+        data = np.random.RandomState(6).randint(0, 256, (37, 8), dtype=np.uint8)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        packed = np.empty((len(data), 12), dtype=np.uint8)
+        packed[:, :4] = np.frombuffer((8).to_bytes(4, "little"), dtype=np.uint8)
+        packed[:, 4:] = data
+        originals = [root / "00.bvecs", root / "01.bvecs"]
+        packed[:12].tofile(originals[0])
+        packed[12:].tofile(originals[1])
+        for corrupt in (False, True):
+            copies = _ssd.prepare_stage(originals, 12, [(0, len(data))], str(root / "stage"))
+            source = SSDRowSource(copies, 8, 0, len(data), header_bytes=4)
+            self.addCleanup(source.close)
+            loader = self.loader(source, 10)
+            orders = [loader.order(seed) for seed in (1, 2)]
+            write = _ssd.os.pwrite
+            with mock.patch.object(_ssd.os, "pwrite", side_effect=(
+                    lambda fd, block, at: write(fd, bytes(len(block)), at)) if corrupt else write):
+                stage = loader.stage = _ssd.PipelinedStage(
+                    originals, copies, source, orders[0], loader.window_rows,
+                    loader.rows_per_chunk, getattr(orders[0], "shift", 0), threads=2,
+                )
+                outputs = []
+                with self.assertWarns(UserWarning) if corrupt else contextlib.nullcontext():
+                    for p, order in enumerate(orders):
+                        following = orders[p + 1] if p + 1 < len(orders) else None
+                        with closing(loader.batches(order, next_order=following)) as iterator:
+                            outputs.append(torch.cat([rows.clone() for rows in iterator]))
+                    torch.cuda.synchronize()
+                stage.close()
+            self.assertEqual(stage.failed is not None, corrupt)
+            for order, rows in zip(orders, outputs):
+                torch.testing.assert_close(rows.cpu(), torch.from_numpy(data[order]).float(), rtol=0, atol=0)
 
     def test_early_close_preserves_owned_output(self):
         data = np.arange(37 * 8, dtype=np.uint16).astype(np.uint8).reshape(37, 8)

@@ -22,6 +22,7 @@ import queue
 import shutil
 import socket
 import tempfile
+import threading
 import time
 import warnings
 
@@ -235,19 +236,8 @@ class SSDRowSource:
         return stats
 
 
-def stage_files(paths, row_bytes, row_ranges, directory, sums=None, max_bytes=None, threads=16, piece=1 << 30):
-    """Copy the rows a node reads to a local directory; return the copies or None.
-
-    ``row_ranges`` are [begin, end) rows of the concatenated files. Copies
-    keep each file's size (parts not read stay sparse), so offsets do not
-    change. A copy is checked against ``sums`` (SHA256SUMS lines) when a
-    whole listed file is staged, else by its first, middle and last 16 MiB
-    per range; failed ranges are copied once more. If the copy needs more
-    than ``max_bytes`` or the free space, or an I/O error occurs, or a copy
-    stays wrong, this warns, leaves nothing behind and returns None: read
-    the originals. Copies left on this host by exited
-    processes are removed first; the caller removes the returned directory.
-    """
+def _stage_spans(paths, row_bytes, row_ranges):
+    """Merge [begin, end) row ranges into whole-MiB byte spans per file."""
     merged = []
     for lo, hi in sorted(row_ranges):
         if merged and lo <= merged[-1][1]:
@@ -263,6 +253,65 @@ def stage_files(paths, row_bytes, row_ranges, directory, sums=None, max_bytes=No
                 begin = (max(lo, first) - first) * row_bytes >> 20 << 20
                 spans.append((path, begin, min(size, -(-(min(hi, last) - first) * row_bytes >> 20) << 20)))
         first = last
+    return spans
+
+
+def _stage_directory(directory, need, max_bytes):
+    """Sweep this host's copies left by exited processes, check the space and
+    make this process's copy directory; raise OSError if the copy cannot fit."""
+    # Copies are named by a short hash of the host name, so the sweep can tell
+    # this host's copies apart without writing the host name to disk.
+    host = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
+    prefix = "ssd_stage.%s." % host
+    os.makedirs(directory, exist_ok=True)
+    for old in glob.glob(os.path.join(glob.escape(directory), glob.escape(prefix) + "*")):
+        try:  # remove copies whose process has exited
+            os.kill(int(os.path.basename(old)[len(prefix):].split(".")[0]), 0)
+        except ProcessLookupError:
+            shutil.rmtree(old, ignore_errors=True)
+        except (ValueError, PermissionError):
+            pass
+    if need + (1 << 30) > shutil.disk_usage(directory).free or need > (max_bytes or need):
+        raise OSError(errno.ENOSPC, "%.1f GB needed" % (need / 1e9), directory)
+    return tempfile.mkdtemp(prefix=prefix + "%d." % os.getpid(), dir=directory)
+
+
+def prepare_stage(paths, row_bytes, row_ranges, directory, max_bytes=None):
+    """Make empty sparse copies for a pipelined copy; return them or None.
+
+    Checks space as stage_files does; on failure it warns, leaves nothing
+    behind and returns None (read the originals).
+    """
+    own = None
+    try:
+        need = sum(end - begin for _, begin, end in _stage_spans(paths, row_bytes, row_ranges))
+        own = _stage_directory(directory, need, max_bytes)
+        copies = [os.path.join(own, os.path.basename(p)) for p in paths]
+        for path, copy in zip(paths, copies):
+            with open(copy, "wb") as f:
+                f.truncate(os.path.getsize(path))
+        return copies
+    except OSError as error:
+        warnings.warn("staging in %s failed (%s): reading the original files" % (directory, error))
+        if own:
+            shutil.rmtree(own, ignore_errors=True)
+        return None
+
+
+def stage_files(paths, row_bytes, row_ranges, directory, sums=None, max_bytes=None, threads=16, piece=1 << 30):
+    """Copy the rows a node reads to a local directory; return the copies or None.
+
+    ``row_ranges`` are [begin, end) rows of the concatenated files. Copies
+    keep each file's size (parts not read stay sparse), so offsets do not
+    change. A copy is checked against ``sums`` (SHA256SUMS lines) when a
+    whole listed file is staged, else by its first, middle and last 16 MiB
+    per range; failed ranges are copied once more. If the copy needs more
+    than ``max_bytes`` or the free space, or an I/O error occurs, or a copy
+    stays wrong, this warns, leaves nothing behind and returns None: read
+    the originals. Copies left on this host by exited
+    processes are removed first; the caller removes the returned directory.
+    """
+    spans = _stage_spans(paths, row_bytes, row_ranges)
     expected = {}
     if sums is not None and os.path.exists(sums):
         with open(sums) as f:
@@ -295,23 +344,9 @@ def stage_files(paths, row_bytes, row_ranges, directory, sums=None, max_bytes=No
                     return False
         return True
 
-    # Copies are named by a short hash of the host name, so the sweep can tell
-    # this host's copies apart without writing the host name to disk.
-    host = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
-    prefix, own = "ssd_stage.%s." % host, None
+    own = None
     try:
-        os.makedirs(directory, exist_ok=True)
-        for old in glob.glob(os.path.join(glob.escape(directory), glob.escape(prefix) + "*")):
-            try:  # remove copies whose process has exited
-                os.kill(int(os.path.basename(old)[len(prefix):].split(".")[0]), 0)
-            except ProcessLookupError:
-                shutil.rmtree(old, ignore_errors=True)
-            except (ValueError, PermissionError):
-                pass
-        need = sum(end - begin for _, begin, end in spans)
-        if need + (1 << 30) > shutil.disk_usage(directory).free or need > (max_bytes or need):
-            raise OSError(errno.ENOSPC, "%.1f GB needed" % (need / 1e9), directory)
-        own = tempfile.mkdtemp(prefix=prefix + "%d." % os.getpid(), dir=directory)
+        own = _stage_directory(directory, sum(end - begin for _, begin, end in spans), max_bytes)
         staged = {p: os.path.join(own, os.path.basename(p)) for p in paths}
         for path in paths:
             with open(staged[path], "wb") as f:
@@ -453,6 +488,133 @@ class PassOrder(np.ndarray):
         self.shift = getattr(obj, "shift", 0)
 
 
+def _pread_all(fd, size, at):
+    parts, got = [], 0
+    while got < size:
+        data = os.pread(fd, size - got, at + got)
+        if not data:
+            raise OSError(errno.EIO, "short read while staging")
+        parts.append(data)
+        got += len(data)
+    return b"".join(parts)
+
+
+class PipelinedStage:
+    """Copy a rank's rows to its staged copies while training reads them.
+
+    Chunks are copied in the order the first pass reads them (``order`` is
+    that pass's row order and ``shift`` its scan-chunk grid shift), so the
+    first pass's k-th window waits only for its own chunks; later reads wait
+    for the whole copy. Each chunk is read back and compared with the bytes
+    read from the original, and copied once more if they differ. If a chunk
+    stays wrong or an I/O error occurs, ``failed`` is set and the loader
+    switches to ``fallback``, a source on the original files.
+    """
+
+    def __init__(self, originals, copies, source, order, window_rows, rows_per_chunk, shift=0, threads=4):
+        self.source, self.rows_per_chunk, self.shift = source, rows_per_chunk, shift
+        count = -(-(source.n + shift) // rows_per_chunk)
+        seen, parts, self.window_end = np.zeros(count, dtype=bool), [], []
+        for at in range(0, len(order), window_rows):
+            chunks = np.unique((np.asarray(order[at:at + window_rows]) + shift) // rows_per_chunk)
+            chunks = chunks[~seen[chunks]]
+            seen[chunks] = True
+            parts.append(chunks)
+            self.window_end.append(sum(len(part) for part in parts))
+        parts.append(np.flatnonzero(~seen))
+        self.schedule = np.concatenate(parts)
+        self.ready = np.zeros(count, dtype=bool)
+        self.cond = threading.Condition()
+        self.next = self.prefix = self.fills = 0
+        self.failed = None
+        self.stats = dict(copied_bytes=0, recopied_pieces=0, wait_s=0.0, window_waits=[], done_s=None)
+        self._started = time.perf_counter()
+        self.fallback = SSDRowSource(
+            originals, source.d, source.begin, source.begin + source.n, header_bytes=source.header_bytes,
+        )
+        self.src = [os.open(path, os.O_RDONLY) for path in originals]
+        self.dst = [os.open(path, os.O_RDWR) for path in copies]
+        self.workers = [threading.Thread(target=self._work, daemon=True) for _ in range(threads)]
+        for worker in self.workers:
+            worker.start()
+
+    def _copy(self, chunk):
+        row_bytes, ends = self.source.row_bytes, self.source.ends
+        lo = self.source.begin + max(0, chunk * self.rows_per_chunk - self.shift)
+        hi = self.source.begin + min(self.source.n, (chunk + 1) * self.rows_per_chunk - self.shift)
+        index, done = int(np.searchsorted(ends, lo, side="right")), 0
+        while lo < hi:
+            first = 0 if index == 0 else int(ends[index - 1])
+            top = min(hi, int(ends[index]))
+            at, size = (lo - first) * row_bytes, (top - lo) * row_bytes
+            data = _pread_all(self.src[index], size, at)
+            for attempt in range(2):
+                written = 0
+                while written < size:
+                    written += os.pwrite(self.dst[index], data[written:], at + written)
+                if _pread_all(self.dst[index], size, at) == data:
+                    break
+                with self.cond:
+                    self.stats["recopied_pieces"] += 1
+            else:
+                raise OSError(errno.EIO, "staged copy stayed wrong")
+            os.posix_fadvise(self.dst[index], at, size, os.POSIX_FADV_DONTNEED)
+            done += size
+            lo, index = top, index + 1
+        return done
+
+    def _work(self):
+        try:
+            while True:
+                with self.cond:
+                    if self.failed is not None or self.next >= len(self.schedule):
+                        return
+                    position, self.next = self.next, self.next + 1
+                chunk = int(self.schedule[position])
+                done = self._copy(chunk)
+                with self.cond:
+                    self.ready[chunk] = True
+                    self.stats["copied_bytes"] += done
+                    moved = False
+                    while self.prefix < len(self.schedule) and self.ready[self.schedule[self.prefix]]:
+                        self.prefix += 1
+                        moved = True
+                    if self.prefix == len(self.schedule) and self.stats["done_s"] is None:
+                        self.stats["done_s"] = time.perf_counter() - self._started
+                    if moved:
+                        self.cond.notify_all()
+        except BaseException as error:
+            with self.cond:
+                if self.failed is None:
+                    self.failed = error
+                    warnings.warn("staging failed (%s): reading the original files" % error)
+                self.cond.notify_all()
+
+    def wait(self, sequential=False):
+        """Block until the next first-pass window's chunks, else all, are copied (or staging failed)."""
+        window = self.fills
+        if not sequential:
+            self.fills += 1
+        first_pass = not sequential and window < len(self.window_end)
+        need = self.window_end[window] if first_pass else len(self.schedule)
+        began = time.perf_counter()
+        with self.cond:
+            self.cond.wait_for(lambda: self.failed is not None or self.prefix >= need)
+        waited = time.perf_counter() - began
+        self.stats["wait_s"] += waited
+        if first_pass:
+            self.stats["window_waits"].append(round(waited, 3))
+
+    def close(self):
+        with self.cond:
+            self.next = len(self.schedule)  # hand out no more chunks
+        for worker in self.workers:
+            worker.join()
+        for fd in self.src + self.dst:
+            os.close(fd)
+        self.fallback.close()
+
+
 class SSDPrefetch:
     """Two host windows, chunk scans, and one CUDA batch copied ahead.
 
@@ -491,6 +653,7 @@ class SSDPrefetch:
                 "SSD prefetch sizes and thread counts must be positive"
             )
         self.source, self.device = source, torch.device(device)
+        self.stage = None  # a PipelinedStage that reads wait on, if any
         if self.device.type != "cuda":
             raise ValueError("SSD prefetch requires CUDA")
         self.batch_size, self.chunk_groups = batch_size, chunk_groups
@@ -530,7 +693,14 @@ class SSDPrefetch:
         result.shift = (self.rows_per_chunk - offset) % self.rows_per_chunk
         return result
 
+    def _wait_for_stage(self, sequential=False):
+        if self.stage is not None:
+            self.stage.wait(sequential)
+            if self.stage.failed is not None:
+                self.source = self.stage.fallback
+
     def fill_window(self, request, out):
+        self._wait_for_stage()
         planned = time.perf_counter()
         shift = getattr(request, "shift", 0)
         rows, order, chunks, bounds = _plan_window(
@@ -627,6 +797,8 @@ class SSDPrefetch:
                 buffer.close()
 
     def fill_sequential(self, start, end, out):
+        self._wait_for_stage(sequential=True)
+
         def tasks():
             for begin in range(start, end, self.rows_per_chunk):
                 yield begin, min(end, begin + self.rows_per_chunk)

@@ -28,6 +28,9 @@ rows (1B, 4 groups, 64 MiB: 0.63% per pass with the offset, 0.83% without,
 but the fill thread's per-chunk Python work then competes with training for
 the GIL and adds stall (see the PR body).
 --ssd-read-threads defaults to 16 / --ssd-chunk-mib, at least 1.
+--ssd-pipelined-stage starts training at once and copies each rank's rows
+during the first pass, in the order that pass reads them; the first pass's
+windows wait only for their own chunks.
 The next pass's order is computed, and its first window filled, during the
 last window of each pass (--no-ssd-prefetch-next-pass turns this off).
 --ssd-prefetch-chunk-groups 0 gives each prefetch window its own scan
@@ -55,14 +58,14 @@ if __package__:
     from .dino_data import (
         DinoBvecs, DinoQueries, DinoTrainset, compute_mse_per_batches,
     )
-    from .ssd_streaming import SSDPrefetch, SSDRowSource, stage_files
+    from .ssd_streaming import PipelinedStage, SSDPrefetch, SSDRowSource, prepare_stage, stage_files
     from .lloyd import LloydShardedCentroids, LloydShardedCentroidsIVF
 else:
     from demo_sharded_centroids import launch, parser as resident_parser
     from dino_data import (
         DinoBvecs, DinoQueries, DinoTrainset, compute_mse_per_batches,
     )
-    from ssd_streaming import SSDPrefetch, SSDRowSource, stage_files
+    from ssd_streaming import PipelinedStage, SSDPrefetch, SSDRowSource, prepare_stage, stage_files
     from lloyd import LloydShardedCentroids, LloydShardedCentroidsIVF
 
 from faiss.contrib.e_means import EmeansShardedCentroids, EmeansShardedCentroidsIVF
@@ -96,7 +99,8 @@ def run(args):
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl", timeout=timedelta(minutes=60))
-    source = staged = None
+    source = staged = stage = None
+    pipelined = False
     try:
         rank, ranks = dist.get_rank(), dist.get_world_size()
         final_closing_mean = args.final_closing_mean and not args.kmeans
@@ -116,24 +120,31 @@ def run(args):
             hosts, copies = [None] * ranks, [None] * ranks
             dist.all_gather_object(hosts, socket.gethostname())
             node = [r for r in range(ranks) if hosts[r] == hosts[rank]]
-            if rank == node[0]:
-                copies[rank] = stage_files(
-                    dataset.paths, dataset.row_bytes,
-                    [(args.n * r // ranks, args.n * (r + 1) // ranks) for r in node],
-                    args.ssd_stage_dir, sums=os.path.join(args.data, "SHA256SUMS"),
-                    max_bytes=args.ssd_stage_max_gib and int(args.ssd_stage_max_gib * (1 << 30)),
+            ranges = [(args.n * r // ranks, args.n * (r + 1) // ranks) for r in node]
+            max_bytes = args.ssd_stage_max_gib and int(args.ssd_stage_max_gib * (1 << 30))
+            if rank == node[0] and args.ssd_pipelined_stage:
+                # Empty sparse copies; every rank fills its own rows during training.
+                copies[rank] = prepare_stage(
+                    dataset.paths, dataset.row_bytes, ranges, args.ssd_stage_dir, max_bytes=max_bytes,
                 )
-                if copies[rank]:
-                    staged = os.path.dirname(copies[rank][0])
+            elif rank == node[0]:
+                copies[rank] = stage_files(
+                    dataset.paths, dataset.row_bytes, ranges, args.ssd_stage_dir,
+                    sums=os.path.join(args.data, "SHA256SUMS"), max_bytes=max_bytes,
+                )
+            if rank == node[0] and copies[rank]:
+                staged = os.path.dirname(copies[rank][0])
 
-                    def remove_and_exit(signum, frame):
-                        shutil.rmtree(staged, ignore_errors=True)
-                        signal.signal(signum, signal.SIG_DFL)
-                        os.kill(os.getpid(), signum)
+                def remove_and_exit(signum, frame):
+                    shutil.rmtree(staged, ignore_errors=True)
+                    signal.signal(signum, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
 
-                    signal.signal(signal.SIGTERM, remove_and_exit)
+                signal.signal(signal.SIGTERM, remove_and_exit)
             dist.all_gather_object(copies, copies[rank])
+            originals = dataset.paths
             dataset.paths = copies[node[0]] or dataset.paths
+            pipelined = args.ssd_pipelined_stage and copies[node[0]] is not None
         test_vectors = (
             None
             if args.initialization_only
@@ -238,7 +249,14 @@ def run(args):
         )
         if rank == 0:
             print("Queued SSD reads for random initial centroids", flush=True)
-        initial_stats = source.gather(ids, initial, depth=args.ssd_io_depth)
+        if pipelined:  # the copies are still empty: read the initial rows from the originals
+            first_source = SSDRowSource(originals, dataset.d, source.begin, source.begin + source.n, header_bytes=4)
+            try:
+                initial_stats = first_source.gather(ids, initial, depth=args.ssd_io_depth)
+            finally:
+                first_source.close()
+        else:
+            initial_stats = source.gather(ids, initial, depth=args.ssd_io_depth)
         initial_stats["time_s"] = time.perf_counter() - start
         loader.stats["bytes_read"] += initial_stats["bytes_read"]
         if args.initialization_only:
@@ -302,6 +320,13 @@ def run(args):
                 )
             return orders.get(e)
 
+        if pipelined:
+            # Copy this rank's rows in the order the first pass reads them.
+            first = pass_order(0).result()
+            stage = loader.stage = PipelinedStage(
+                originals, dataset.paths, source, first, loader.window_rows,
+                loader.rows_per_chunk, getattr(first, "shift", 0),
+            )
         for epoch, global_rows in enumerate(model.recipe["epoch_rows"]):
             passes = sum(model.recipe["epoch_rows"][:epoch + 1]) / args.n
             epoch_steps = model.recipe["epoch_steps"][epoch]
@@ -439,6 +464,8 @@ def run(args):
         if args.kmeans:
             report["pre_update_train_mse"] = report.pop("moving_pass_mse")
             report["train_assignment_mse"] = model.iteration_stats[-1]["assignment_mse"]
+        if stage is not None:
+            report["pipelined_stage"] = dict(stage.stats, failed=None if stage.failed is None else repr(stage.failed))
         if rank == 0:
             print(f"PASS rank={rank}: {json.dumps(report)}", flush=True)
         if args.output:
@@ -453,6 +480,8 @@ def run(args):
                 f"{args.output}.rank{rank}.pt",
             )
     finally:
+        if stage is not None:
+            stage.close()
         if source is not None:
             source.close()
         if staged:
@@ -498,6 +527,11 @@ def parser():
     result.add_argument(
         "--ssd-stage-max-gib", type=float,
         help="read the originals if this node's copy would exceed this size",
+    )
+    result.add_argument(
+        "--ssd-pipelined-stage", action="store_true",
+        help="with --ssd-stage-dir: start at once and copy during the first pass, "
+        "in the order it reads, instead of copying first",
     )
     result.add_argument(
         "--no-ssd-prefetch-next-pass", dest="ssd_prefetch_next_pass", action="store_false",
